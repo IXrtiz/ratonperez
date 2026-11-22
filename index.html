@@ -54,6 +54,18 @@ nav button:focus-visible,#voz:focus-visible{outline:4px solid #fff;outline-offse
   nav button{min-height:54px;justify-content:flex-start;padding-left:18px}
   nav button svg{width:32px;height:32px}
 }
+#arbtn{font:700 15px Fredoka,system-ui,sans-serif;border:0;border-radius:999px;padding:10px 16px;min-height:44px;cursor:pointer;
+  background:var(--red);color:#fff;box-shadow:0 3px 0 var(--red-d)}
+#arbtn[hidden]{display:none}
+/* AR overlay (shown by Chrome on top of the camera image) */
+#arui{display:none;position:fixed;inset:0;pointer-events:none;font-family:Fredoka,system-ui,sans-serif}
+#arui.on{display:block}
+#arui .top{position:absolute;top:max(12px,env(safe-area-inset-top));left:12px;right:12px;display:flex;gap:8px;align-items:flex-start}
+#arui .hint{flex:1;background:rgba(255,255,255,.92);color:#3b2106;border-radius:18px;padding:10px 14px;font-size:16px;font-weight:600;line-height:1.25}
+#arui .top button{pointer-events:auto;border:0;border-radius:999px;min-height:44px;padding:8px 14px;font:700 15px Fredoka,system-ui,sans-serif;background:#fff;color:#3b2106;box-shadow:0 3px 0 rgba(0,0,0,.25)}
+#arui nav{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;grid-template-columns:1fr;gap:9px;max-width:520px}
+#arui nav button{min-height:54px;justify-content:flex-start;padding-left:18px}
+#arui #bubble{position:fixed}
 </style>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/"}}</script>
 </head>
@@ -63,6 +75,7 @@ nav button:focus-visible,#voz:focus-visible{outline:4px solid #fff;outline-offse
     <h1>La casa del Ratón Pérez</h1>
     <p>Toca un botón y mira quién sale por la puertita.</p>
   </div>
+  <button id="arbtn" type="button" hidden>Ver en mi espacio</button>
   <button id="voz" type="button" aria-pressed="true">Voz: sí</button>
 </header>
 
@@ -87,6 +100,14 @@ nav button:focus-visible,#voz:focus-visible{outline:4px solid #fff;outline-offse
     <span>Aprobar cepillado<small>Muéstrale tus dientes</small></span>
   </button>
 </nav>
+
+<div id="arui">
+  <div class="top">
+    <div class="hint" id="arhint">Mueve el celular despacio apuntando al piso. Cuando aparezca el círculo, tócalo para poner la casita.</div>
+    <button type="button" id="armove" hidden>Mover</button>
+    <button type="button" id="arexit">Salir</button>
+  </div>
+</div>
 
 <script type="module">
 import * as THREE from 'three';
@@ -118,7 +139,8 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
   renderer.toneMapping = THREE.NeutralToneMapping;
   renderer.toneMappingExposure = 1.0;
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.type = THREE.PCFShadowMap;
+  renderer.xr.enabled = true;
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0xf3d9a4);
@@ -134,12 +156,23 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
   sun.shadow.bias = -0.0004;
   sun.shadow.normalBias = 0.02;
   scene.add(sun);
+  scene.add(sun.target);
+  // everything that belongs to the little house lives in one group, so AR can move and shrink it
+  const house = new THREE.Group();
+  scene.add(house);
   const roomLight = new THREE.PointLight(0xffd9a0, 4, 0, 2);
   roomLight.position.set(0, 2.0, -1.3);
-  scene.add(roomLight);
+  house.add(roomLight);
   const backLight = new THREE.PointLight(0xfff0e0, 2.2, 0, 2);
   backLight.position.set(0, 1.4, -1.6);
-  scene.add(backLight);
+  house.add(backLight);
+  // soft shadow on the real floor in AR
+  const shadowCatcher = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), new THREE.ShadowMaterial({ opacity: 0.3 }));
+  shadowCatcher.rotation.x = -Math.PI / 2;
+  shadowCatcher.position.set(0, 0.003, 1.0);
+  shadowCatcher.receiveShadow = true;
+  shadowCatcher.visible = false;
+  house.add(shadowCatcher);
 
   const camera = new THREE.PerspectiveCamera(38, 1, 0.05, 60);
   const target = new THREE.Vector3(0, 0.8, -0.1);
@@ -149,6 +182,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     minPolarAngle: 1.0, maxPolarAngle: 1.62, minDistance: 2.2, maxDistance: 9 });
 
   function fit() {
+    if (renderer.xr.isPresenting) return;
     const w = stage.clientWidth, h = stage.clientHeight;
     renderer.setSize(w, h, false);
     camera.aspect = w / h;
@@ -163,7 +197,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
   ro.observe(stage);
   fit();
 
-  let mixer = null, clips = {}, current = null, busy = false, evs = [], evIdx = 0, head = null, bubbleUntil = -1;
+  let mixer = null, clips = {}, current = null, busy = false, evs = [], evIdx = 0, head = null, bubbleUntil = -1, outsideFloor = null;
   const v3 = new THREE.Vector3();
 
   // ---------- voice
@@ -237,7 +271,8 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
         if (o.isSkinnedMesh) o.frustumCulled = false;
       }
     });
-    scene.add(root);
+    house.add(root);
+    outsideFloor = root.getObjectByName('Piso_Afuera');
     head = root.getObjectByName('head');
     mixer = new THREE.AnimationMixer(root);
     gltf.animations.forEach(a => { clips[a.name] = a; });
@@ -250,6 +285,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     mixer.update(0);
     loader.remove();
     buttons.forEach(b => { b.disabled = false; });
+    checkAR();
   }, e => {
     if (e.total) pbar.style.width = Math.round(100 * e.loaded / e.total) + '%';
   }, err => {
@@ -257,12 +293,131 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     console.error(err);
   });
 
+  // ---------- augmented reality (Android Chrome, WebXR)
+  const AR_SCALE = 0.35;                       // Ratón Pérez about 40 cm tall, door about 35 x 52 cm
+  const arBtn = document.getElementById('arbtn');
+  const arui = document.getElementById('arui');
+  const arHint = document.getElementById('arhint');
+  const arMove = document.getElementById('armove');
+  const arExit = document.getElementById('arexit');
+  const nav = document.querySelector('nav');
+  const reticle = new THREE.Mesh(new THREE.RingGeometry(0.09, 0.12, 40).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 }));
+  reticle.matrixAutoUpdate = false;
+  reticle.visible = false;
+  scene.add(reticle);
+  let arSession = null, hitSource = null, placed = false;
+  const tmpPos = new THREE.Vector3(), tmpQ = new THREE.Quaternion(), tmpS = new THREE.Vector3(), camPos = new THREE.Vector3();
+
+  async function checkAR() {
+    try {
+      if (navigator.xr && await navigator.xr.isSessionSupported('immersive-ar')) arBtn.hidden = false;
+    } catch (e) {}
+  }
+  // taps on the overlay buttons must not also count as "place the house"
+  arui.addEventListener('beforexrselect', e => { if (e.target.closest('button')) e.preventDefault(); });
+
+  function setPlaced(p) {
+    placed = p;
+    house.visible = p;
+    arMove.hidden = !p;
+    nav.style.display = p ? '' : 'none';
+    arHint.textContent = p ? 'Toca un botón para que salga el Ratón Pérez.'
+      : 'Mueve el celular despacio apuntando al piso. Cuando aparezca el círculo, tócalo para poner la casita.';
+  }
+
+  arBtn.addEventListener('click', async () => {
+    if (arSession || !mixer) return;
+    unlock();
+    try {
+      arSession = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: { root: arui } });
+    } catch (e) {
+      arSession = null;
+      arHint.textContent = '';
+      alertBox('No se pudo abrir la cámara en modo realidad aumentada en este celular.');
+      return;
+    }
+    arui.classList.add('on');
+    arui.appendChild(nav);
+    arui.appendChild(bubble);
+    scene.background = null;
+    if (outsideFloor) outsideFloor.visible = false;
+    shadowCatcher.visible = true;
+    house.scale.setScalar(AR_SCALE);
+    roomLight.intensity = 4 * AR_SCALE * AR_SCALE;
+    backLight.intensity = 2.2 * AR_SCALE * AR_SCALE;
+    controls.enabled = false;
+    setPlaced(false);
+    renderer.xr.setReferenceSpaceType('local');
+    await renderer.xr.setSession(arSession);
+    const viewer = await arSession.requestReferenceSpace('viewer');
+    hitSource = await arSession.requestHitTestSource({ space: viewer });
+    arSession.addEventListener('select', () => {
+      if (placed || !reticle.visible) return;
+      reticle.matrix.decompose(tmpPos, tmpQ, tmpS);
+      house.position.copy(tmpPos);
+      renderer.xr.getCamera().getWorldPosition(camPos);
+      house.rotation.set(0, Math.atan2(camPos.x - tmpPos.x, camPos.z - tmpPos.z), 0);
+      sun.position.copy(tmpPos).add(new THREE.Vector3(-0.9, 1.6, 1.6));
+      sun.target.position.copy(tmpPos);
+      Object.assign(sun.shadow.camera, { left: -1.4, right: 1.4, top: 1.4, bottom: -1.4, near: 0.1, far: 6 });
+      sun.shadow.camera.updateProjectionMatrix();
+      reticle.visible = false;
+      setPlaced(true);
+    });
+    arSession.addEventListener('end', endAR);
+  });
+  arMove.addEventListener('click', () => setPlaced(false));
+  arExit.addEventListener('click', () => { if (arSession) arSession.end(); });
+
+  function endAR() {
+    arSession = null;
+    hitSource = null;
+    reticle.visible = false;
+    arui.classList.remove('on');
+    document.body.insertBefore(nav, arui);
+    stage.appendChild(bubble);
+    nav.style.display = '';
+    scene.background = new THREE.Color(0xf3d9a4);
+    if (outsideFloor) outsideFloor.visible = true;
+    shadowCatcher.visible = false;
+    house.visible = true;
+    house.position.set(0, 0, 0);
+    house.rotation.set(0, 0, 0);
+    house.scale.setScalar(1);
+    roomLight.intensity = 4;
+    backLight.intensity = 2.2;
+    sun.position.set(-2.5, 4.5, 4.5);
+    sun.target.position.set(0, 0, 0);
+    Object.assign(sun.shadow.camera, { left: -3, right: 3, top: 3, bottom: -1, near: 0.5, far: 14 });
+    sun.shadow.camera.updateProjectionMatrix();
+    controls.enabled = true;
+    fit();
+  }
+  function alertBox(msg) {
+    bubble.textContent = msg;
+    bubble.classList.add('on');
+    setTimeout(hideBubble, 4000);
+  }
+
   // ---------- loop
   const clock = new THREE.Clock();
-  renderer.setAnimationLoop(() => {
+  renderer.setAnimationLoop((time, frame) => {
     const dt = Math.min(clock.getDelta(), 0.1);
     if (mixer) mixer.update(dt);
-    controls.update();
+    if (!arSession) controls.update();
+    if (frame && hitSource && !placed) {
+      const hits = frame.getHitTestResults(hitSource);
+      const ref = renderer.xr.getReferenceSpace();
+      if (hits.length && ref) {
+        const pose = hits[0].getPose(ref);
+        reticle.visible = !!pose;
+        if (pose) reticle.matrix.fromArray(pose.transform.matrix);
+      } else {
+        reticle.visible = false;
+      }
+    }
     if (busy && current) {
       const t = current.time;
       while (evIdx < evs.length && t >= evs[evIdx].t) { say(evs[evIdx]); evIdx++; }
@@ -270,9 +425,9 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     }
     if (bubble.classList.contains('on') && head) {
       head.getWorldPosition(v3);
-      v3.y += 0.62;
-      v3.project(camera);
-      const w = stage.clientWidth, h = stage.clientHeight;
+      v3.y += 0.62 * house.scale.y;
+      v3.project(arSession ? renderer.xr.getCamera() : camera);
+      const w = arSession ? window.innerWidth : stage.clientWidth, h = arSession ? window.innerHeight : stage.clientHeight;
       const bw = bubble.offsetWidth, bh = bubble.offsetHeight;
       let x = (v3.x * 0.5 + 0.5) * w, y = (-v3.y * 0.5 + 0.5) * h;
       x = Math.min(Math.max(x, bw / 2 + 8), w - bw / 2 - 8);
