@@ -66,6 +66,11 @@ nav button:focus-visible,#voz:focus-visible{outline:4px solid #fff;outline-offse
 #arui nav{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;grid-template-columns:1fr;gap:9px;max-width:520px}
 #arui nav button{min-height:54px;justify-content:flex-start;padding-left:18px}
 #arui #bubble{position:fixed}
+#arui{z-index:3}
+#arui .hint[hidden]{display:none}
+#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none}
+body.camon #cam{display:block}
+body.camon #stage{position:fixed;inset:0;margin:0;border-radius:0;z-index:2;background:#000;box-shadow:none}
 </style>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/"}}</script>
 </head>
@@ -75,11 +80,12 @@ nav button:focus-visible,#voz:focus-visible{outline:4px solid #fff;outline-offse
     <h1>La casa del Ratón Pérez</h1>
     <p>Toca un botón y mira quién sale por la puertita.</p>
   </div>
-  <button id="arbtn" type="button" hidden>Ver en mi espacio</button>
+  <button id="arbtn" type="button" hidden>Abrir cámara</button>
   <button id="voz" type="button" aria-pressed="true">Voz: sí</button>
 </header>
 
 <main id="stage">
+  <video id="cam" playsinline muted></video>
   <canvas id="c" aria-label="La pared con la puertita del Ratón Pérez"></canvas>
   <div id="bubble" aria-hidden="true"></div>
   <div id="loader"><div>Abriendo la casita…<div class="bar"><i id="pbar"></i></div></div></div>
@@ -133,7 +139,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
   const buttons = [...document.querySelectorAll('nav button')];
   const vozBtn = document.getElementById('voz');
 
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.NeutralToneMapping;
@@ -181,9 +187,16 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
   Object.assign(controls, { enablePan: false, enableDamping: true, minAzimuthAngle: -0.7, maxAzimuthAngle: 0.7,
     minPolarAngle: 1.0, maxPolarAngle: 1.62, minDistance: 2.2, maxDistance: 9 });
 
+  let camOn = false;
   function fit() {
     if (renderer.xr.isPresenting) return;
     const w = stage.clientWidth, h = stage.clientHeight;
+    if (camOn) {
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      return;
+    }
     renderer.setSize(w, h, false);
     camera.aspect = w / h;
     const v = THREE.MathUtils.degToRad(camera.fov / 2);
@@ -293,30 +306,79 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     console.error(err);
   });
 
-  // ---------- augmented reality (Android Chrome, WebXR)
+  // ---------- "Abrir cámara": real AR (WebXR) when the phone supports it, otherwise camera + gyroscope
   const AR_SCALE = 0.35;                       // Ratón Pérez about 40 cm tall, door about 35 x 52 cm
   const arBtn = document.getElementById('arbtn');
   const arui = document.getElementById('arui');
   const arHint = document.getElementById('arhint');
   const arMove = document.getElementById('armove');
   const arExit = document.getElementById('arexit');
+  const camVideo = document.getElementById('cam');
   const nav = document.querySelector('nav');
   const reticle = new THREE.Mesh(new THREE.RingGeometry(0.09, 0.12, 40).rotateX(-Math.PI / 2),
     new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 }));
   reticle.matrixAutoUpdate = false;
   reticle.visible = false;
   scene.add(reticle);
-  let arSession = null, hitSource = null, placed = false;
+  let arSession = null, hitSource = null, placed = false, xrSupported = false;
+  let camStream = null, orient = null, alpha0 = null, camYaw = 0, camDist = 1.8;
+  let noXR = false;
+  try { noXR = localStorage.getItem('rp_noxr') === '1'; } catch (e) {}
   const tmpPos = new THREE.Vector3(), tmpQ = new THREE.Quaternion(), tmpS = new THREE.Vector3(), camPos = new THREE.Vector3();
+  const CAM_H = 1.2;
 
   async function checkAR() {
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) arBtn.hidden = false;
     try {
-      if (navigator.xr && await navigator.xr.isSessionSupported('immersive-ar')) arBtn.hidden = false;
+      if (navigator.xr && await navigator.xr.isSessionSupported('immersive-ar')) { xrSupported = true; arBtn.hidden = false; }
     } catch (e) {}
   }
-  // taps on the overlay buttons must not also count as "place the house"
   arui.addEventListener('beforexrselect', e => { if (e.target.closest('button')) e.preventDefault(); });
 
+  function miniHouse(pos, rotY) {
+    house.position.copy(pos);
+    house.rotation.set(0, rotY, 0);
+    house.scale.setScalar(AR_SCALE);
+    roomLight.intensity = 4 * AR_SCALE * AR_SCALE;
+    backLight.intensity = 2.2 * AR_SCALE * AR_SCALE;
+    if (outsideFloor) outsideFloor.visible = false;
+    shadowCatcher.visible = true;
+    sun.position.copy(pos).add(new THREE.Vector3(-0.9, 1.6, 1.6));
+    sun.target.position.copy(pos);
+    Object.assign(sun.shadow.camera, { left: -1.4, right: 1.4, top: 1.4, bottom: -1.4, near: 0.1, far: 6 });
+    sun.shadow.camera.updateProjectionMatrix();
+  }
+  function restoreHouse() {
+    house.visible = true;
+    house.position.set(0, 0, 0);
+    house.rotation.set(0, 0, 0);
+    house.scale.setScalar(1);
+    roomLight.intensity = 4;
+    backLight.intensity = 2.2;
+    if (outsideFloor) outsideFloor.visible = true;
+    shadowCatcher.visible = false;
+    sun.position.set(-2.5, 4.5, 4.5);
+    sun.target.position.set(0, 0, 0);
+    Object.assign(sun.shadow.camera, { left: -3, right: 3, top: 3, bottom: -1, near: 0.5, far: 14 });
+    sun.shadow.camera.updateProjectionMatrix();
+    scene.background = new THREE.Color(0xf3d9a4);
+    camera.fov = 38;
+    controls.enabled = true;
+  }
+  function showOverlay() {
+    arui.classList.add('on');
+    arui.appendChild(nav);
+    arui.appendChild(bubble);
+    scene.background = null;
+    controls.enabled = false;
+  }
+  function hideOverlay() {
+    arui.classList.remove('on');
+    document.body.insertBefore(nav, arui);
+    stage.appendChild(bubble);
+    nav.style.display = '';
+    arHint.hidden = false;
+  }
   function setPlaced(p) {
     placed = p;
     house.visible = p;
@@ -327,27 +389,32 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
   }
 
   arBtn.addEventListener('click', async () => {
-    if (arSession || !mixer) return;
+    if (arSession || camOn || !mixer) return;
     unlock();
-    try {
-      arSession = await navigator.xr.requestSession('immersive-ar', {
-        requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: { root: arui } });
-    } catch (e) {
-      arSession = null;
-      arHint.textContent = '';
-      alertBox('No se pudo abrir la cámara en modo realidad aumentada en este celular.');
-      return;
+    // iPhone asks for motion permission; it must be requested right inside the tap
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try { await DeviceOrientationEvent.requestPermission(); } catch (e) {}
     }
-    arui.classList.add('on');
-    arui.appendChild(nav);
-    arui.appendChild(bubble);
-    scene.background = null;
-    if (outsideFloor) outsideFloor.visible = false;
-    shadowCatcher.visible = true;
-    house.scale.setScalar(AR_SCALE);
-    roomLight.intensity = 4 * AR_SCALE * AR_SCALE;
-    backLight.intensity = 2.2 * AR_SCALE * AR_SCALE;
-    controls.enabled = false;
+    if (xrSupported && !noXR) {
+      try { await startAR(); return; }
+      catch (e) {
+        console.warn('WebXR AR no disponible, uso la cámara simple', e);
+        noXR = true;
+        try { localStorage.setItem('rp_noxr', '1'); } catch (_) {}
+        if (arSession) { try { await arSession.end(); } catch (_) {} }
+        arSession = null;
+        hideOverlay();
+        restoreHouse();
+      }
+    }
+    await startCam();
+  });
+
+  async function startAR() {
+    arSession = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hit-test'], optionalFeatures: ['dom-overlay'], domOverlay: { root: arui } });
+    showOverlay();
+    miniHouse(new THREE.Vector3(), 0);
     setPlaced(false);
     renderer.xr.setReferenceSpaceType('local');
     await renderer.xr.setSession(arSession);
@@ -356,49 +423,97 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     arSession.addEventListener('select', () => {
       if (placed || !reticle.visible) return;
       reticle.matrix.decompose(tmpPos, tmpQ, tmpS);
-      house.position.copy(tmpPos);
       renderer.xr.getCamera().getWorldPosition(camPos);
-      house.rotation.set(0, Math.atan2(camPos.x - tmpPos.x, camPos.z - tmpPos.z), 0);
-      sun.position.copy(tmpPos).add(new THREE.Vector3(-0.9, 1.6, 1.6));
-      sun.target.position.copy(tmpPos);
-      Object.assign(sun.shadow.camera, { left: -1.4, right: 1.4, top: 1.4, bottom: -1.4, near: 0.1, far: 6 });
-      sun.shadow.camera.updateProjectionMatrix();
+      miniHouse(tmpPos, Math.atan2(camPos.x - tmpPos.x, camPos.z - tmpPos.z));
       reticle.visible = false;
       setPlaced(true);
     });
     arSession.addEventListener('end', endAR);
-  });
-  arMove.addEventListener('click', () => setPlaced(false));
-  arExit.addEventListener('click', () => { if (arSession) arSession.end(); });
-
+  }
   function endAR() {
     arSession = null;
     hitSource = null;
     reticle.visible = false;
-    arui.classList.remove('on');
-    document.body.insertBefore(nav, arui);
-    stage.appendChild(bubble);
-    nav.style.display = '';
-    scene.background = new THREE.Color(0xf3d9a4);
-    if (outsideFloor) outsideFloor.visible = true;
-    shadowCatcher.visible = false;
-    house.visible = true;
-    house.position.set(0, 0, 0);
-    house.rotation.set(0, 0, 0);
-    house.scale.setScalar(1);
-    roomLight.intensity = 4;
-    backLight.intensity = 2.2;
-    sun.position.set(-2.5, 4.5, 4.5);
-    sun.target.position.set(0, 0, 0);
-    Object.assign(sun.shadow.camera, { left: -3, right: 3, top: 3, bottom: -1, near: 0.5, far: 14 });
-    sun.shadow.camera.updateProjectionMatrix();
-    controls.enabled = true;
+    hideOverlay();
+    restoreHouse();
     fit();
   }
+
+  // ----- simple camera mode: phone camera behind, house in front, gyroscope keeps it in place
+  async function startCam() {
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    } catch (e) {
+      alertBox('No se pudo abrir la cámara. Revisa que Chrome tenga permiso para usarla.');
+      return;
+    }
+    camVideo.srcObject = camStream;
+    try { await camVideo.play(); } catch (e) {}
+    camOn = true;
+    document.body.classList.add('camon');
+    showOverlay();
+    renderer.setClearColor(0x000000, 0);
+    arMove.hidden = true;
+    arHint.textContent = 'Apunta el celular hacia el piso: la casita está delante de ti. Desliza el dedo para moverla o acercarla.';
+    setTimeout(() => { if (camOn) arHint.hidden = true; }, 7000);
+    orient = null; alpha0 = null; camYaw = 0; camDist = 1.8;
+    placeCamHouse();
+    camera.fov = 55;
+    camera.position.set(0, CAM_H, 0);
+    window.addEventListener('deviceorientation', onOrient);
+    fit();
+  }
+  function stopCam() {
+    camOn = false;
+    window.removeEventListener('deviceorientation', onOrient);
+    if (camStream) camStream.getTracks().forEach(t => t.stop());
+    camStream = null;
+    camVideo.srcObject = null;
+    document.body.classList.remove('camon');
+    hideOverlay();
+    restoreHouse();
+    fit();
+  }
+  function placeCamHouse() {
+    miniHouse(new THREE.Vector3(-Math.sin(camYaw) * camDist, 0, -Math.cos(camYaw) * camDist), camYaw);
+  }
+  function onOrient(e) {
+    if (e.alpha == null && e.beta == null) return;
+    orient = e;
+    if (alpha0 == null) alpha0 = e.alpha || 0;
+  }
+  // drag: left/right moves the house around you, up/down moves it farther/closer
+  let drag = null;
+  canvas.addEventListener('pointerdown', e => { if (camOn) drag = { x: e.clientX, y: e.clientY }; });
+  window.addEventListener('pointerup', () => { drag = null; });
+  canvas.addEventListener('pointermove', e => {
+    if (!camOn || !drag) return;
+    camYaw -= (e.clientX - drag.x) * 0.005;
+    camDist = Math.min(4, Math.max(0.9, camDist - (e.clientY - drag.y) * 0.008));
+    drag = { x: e.clientX, y: e.clientY };
+    placeCamHouse();
+  });
+  const zee = new THREE.Vector3(0, 0, 1), eul = new THREE.Euler(), qa = new THREE.Quaternion(),
+    qBack = new THREE.Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+  function camFromOrientation() {
+    const d = THREE.MathUtils.degToRad;
+    const so = d((screen.orientation && screen.orientation.angle) || window.orientation || 0);
+    eul.set(d(orient.beta || 0), d((orient.alpha || 0) - alpha0), -d(orient.gamma || 0), 'YXZ');
+    camera.quaternion.setFromEuler(eul);
+    camera.quaternion.multiply(qBack);
+    camera.quaternion.multiply(qa.setFromAxisAngle(zee, -so));
+  }
+
+  arMove.addEventListener('click', () => setPlaced(false));
+  arExit.addEventListener('click', () => {
+    if (arSession) arSession.end();
+    else if (camOn) stopCam();
+  });
   function alertBox(msg) {
     bubble.textContent = msg;
     bubble.classList.add('on');
-    setTimeout(hideBubble, 4000);
+    setTimeout(hideBubble, 4500);
   }
 
   // ---------- loop
@@ -406,7 +521,10 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
   renderer.setAnimationLoop((time, frame) => {
     const dt = Math.min(clock.getDelta(), 0.1);
     if (mixer) mixer.update(dt);
-    if (!arSession) controls.update();
+    if (camOn) {
+      if (orient) camFromOrientation();
+      else camera.lookAt(house.position.x, 0.18, house.position.z);
+    } else if (!arSession) controls.update();
     if (frame && hitSource && !placed) {
       const hits = frame.getHitTestResults(hitSource);
       const ref = renderer.xr.getReferenceSpace();
